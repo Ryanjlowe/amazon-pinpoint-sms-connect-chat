@@ -1,0 +1,195 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  amazon-pinpoint-sms-connect-chat
+
+  Sets up a bridge between Amazon Pinpoint and Amazon Connect to allow for Agent chat over SMS
+
+Parameters:
+  PinpointProjectId:
+    Type: String
+    Description: Amazon Pinpoint Project ID
+  SMSSNSTopicArn:
+    Type: String
+    Description: SNS Topic Arn configured for two-way SMS in Pinpoint
+  ConnectInstanceId:
+    Type: String
+    Default: 12345678-1234-1234-1234-123456789012
+    Description: The instance id of the Amazon Connect instance that the customer will interact with while chatting. You can find this in the Amazon Connect console when viewing your instance details.
+    AllowedPattern: '\w{8}-\w{4}-\w{4}-\w{4}-\w{12}'
+  ConnectContactFlowId:
+    Type: String
+    Default: 12345678-1234-1234-1234-123456789012
+    Description: The contact flow id that the customer will interact with while chatting. This should be the id of the Basic Contact Flow you uploaded.
+    AllowedPattern: '\w{8}-\w{4}-\w{4}-\w{4}-\w{12}'
+
+
+Globals:
+  Function:
+    Timeout: 30
+
+Resources:
+
+  ChatSessionTable:
+    Type: 'AWS::DynamoDB::Table'
+    Properties:
+      TableName: sms-chat-history
+      AttributeDefinitions:
+        - AttributeName: phone_number
+          AttributeType: S
+        - AttributeName: sms_identity
+          AttributeType: S
+      KeySchema:
+        - AttributeName: phone_number
+          KeyType: HASH
+        - AttributeName: sms_identity
+          KeyType: RANGE
+      ProvisionedThroughput:
+        ReadCapacityUnits: "5"
+        WriteCapacityUnits: "5"
+
+  SmsChatBridgeFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: sms_chat_bridge/
+      Handler: app.lambda_handler
+      Runtime: python3.8
+      Environment:
+        Variables:
+          CONNECT_INSTANCE_ID: !Ref ConnectInstanceId
+          CONNECT_CONTACT_FLOW_ID: !Ref ConnectContactFlowId
+          STATE_MACHINE_ARN: !Ref SMSChatStateMachine
+      Events:
+        SMSSNS:
+          Type: SNS
+          Properties:
+            Topic: !Ref SMSSNSTopicArn
+      Policies:
+        - Statement:
+          - Sid: StartStateMachine
+            Effect: Allow
+            Action: states:StartExecution
+            Resource: !Ref SMSChatStateMachine
+          - Sid: DynamoTableAccess
+            Effect: "Allow"
+            Action:
+              - "dynamodb:GetItem"
+              - "dynamodb:PutItem"
+              - "dynamodb:UpdateItem"
+              - "dynamodb:DeleteItem"
+            Resource:
+              - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ChatSessionTable}"
+          - Sid: ConnectChat
+            Effect: "Allow"
+            Action:
+              - "connect:StartChatContact"
+            Resource:
+              - !Sub "arn:aws:connect:${AWS::Region}:${AWS::AccountId}:instance/${ConnectInstanceId}/contact-flow/${ConnectContactFlowId}"
+
+  SMSChatPoller:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: sms_chat_poller/
+      Handler: app.lambda_handler
+      Runtime: python3.8
+      Environment:
+        Variables:
+          PINPOINT_PROJECT_ID: !Ref PinpointProjectId
+      Policies:
+        - Statement:
+          - Sid: SendSMSMessages
+            Effect: Allow
+            Action: mobiletargeting:SendMessages
+            Resource: !Sub arn:aws:mobiletargeting:${AWS::Region}:${AWS::AccountId}:apps/${PinpointProjectId}/messages
+          - Sid: DynamoTableAccess
+            Effect: "Allow"
+            Action:
+              - "dynamodb:GetItem"
+              - "dynamodb:UpdateItem"
+              - "dynamodb:DeleteItem"
+            Resource:
+              - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ChatSessionTable}"
+
+  SMSChatStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      RoleArn: !GetAtt SMSChatStateMachineRole.Arn
+      DefinitionString:
+        !Sub
+          - |-
+            {
+              "StartAt": "Start",
+              "States": {
+                "Start": {
+                  "Type": "Task",
+                  "Resource": "${SMSPollerArn}",
+                  "Next": "CheckDone"
+                },
+                "CheckDone": {
+                  "Type": "Choice",
+                  "Default": "Wait",
+                  "Choices": [
+                    {
+                      "Variable": "$.wait",
+                      "NumericGreaterThan": 3600,
+                      "Next": "End"
+                    }
+                  ]
+                },
+                "Wait": {
+                  "Type": "Wait",
+                  "SecondsPath": "$.wait",
+                  "Next": "Start"
+                },
+                "End": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:states:::dynamodb:deleteItem",
+                  "Parameters": {
+                    "TableName": "${TableName}",
+                    "Key": {
+                      "phone_number": {"S.$": "$.phone_number"},
+                      "sms_identity": {"S.$": "$.sms_identity"}
+                    }
+                  },
+                  "End": true
+                }
+              }
+            }
+          - {SMSPollerArn: !GetAtt SMSChatPoller.Arn, TableName: !Ref ChatSessionTable}
+
+  SMSChatStateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: "Allow"
+            Principal:
+              Service:
+                - "states.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Path: "/"
+      Policies:
+        -
+          PolicyName: "root"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              -
+                Effect: "Allow"
+                Action: "lambda:InvokeFunction"
+                Resource:
+                  - !GetAtt SMSChatPoller.Arn
+              -
+                Effect: "Allow"
+                Action:
+                  - "dynamodb:DeleteItem"
+                Resource:
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ChatSessionTable}"
+
+# Outputs:
+  # ServerlessRestApi is an implicit API created out of Events key under Serverless::Function
+  # Find out more about other implicit resources you can reference within SAM
+  # https://github.com/awslabs/serverless-application-model/blob/master/docs/internals/generated_resources.rst#api
