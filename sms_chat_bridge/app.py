@@ -116,11 +116,3 @@ def get_record(phone_number, sms_identity):
         }
     )
     return response['Item']
-
-def delete_record(phone_number, sms_identity):
-    table.delete_item(
-        Key={
-            'phone_number': phone_number,
-            'sms_identity': sms_identity
-        }
-    )

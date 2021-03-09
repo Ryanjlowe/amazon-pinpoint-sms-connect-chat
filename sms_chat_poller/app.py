@@ -7,6 +7,7 @@ from websocket import create_connection
 
 pinpoint = boto3.client('pinpoint')
 chat = boto3.client('connectparticipant')
+connect = boto3.client('connect')
 dynamodb = boto3.resource('dynamodb')
 table = dynamodb.Table('sms-chat-history')
 
@@ -26,12 +27,9 @@ def lambda_handler(event, context):
 
     phone_number = event['phone_number']
     sms_identity = event['sms_identity']
-    wait = event['wait']
-    new_wait = 0
-    wait_ms = event['wait_ms'] if 'wait_ms' in event else 0.3
-    new_wait_ms = 0.3
     last_id = event['last_id'] if 'last_id' in event else None
     new_last_id = last_id
+    chat_ended = event['chat_ended'] if 'chat_ended' in event else False
 
 
     record = get_record(phone_number, sms_identity)
@@ -40,6 +38,7 @@ def lambda_handler(event, context):
         Type=['WEBSOCKET','CONNECTION_CREDENTIALS'],
         ParticipantToken=record['participation_token']
     )
+    connection_token = create_response['ConnectionCredentials']['ConnectionToken']
 
     logging.info(create_response)
 
@@ -53,10 +52,10 @@ def lambda_handler(event, context):
         cnt = cnt + 1
         response = chat.get_transcript(
             ContactId=record['contact_id'],
-            MaxResults=10,
+            MaxResults=15,
             SortOrder='ASCENDING',
             StartPosition= {'MostRecent': 0} if last_id is None else {'Id': last_id},
-            ConnectionToken=create_response['ConnectionCredentials']['ConnectionToken']
+            ConnectionToken=connection_token
         )
 
         logging.info(response)
@@ -67,9 +66,26 @@ def lambda_handler(event, context):
 
             if last_id == transcript['Id']:
                 logging.info('Nothing new')
-                new_wait_ms = wait_ms * 1.2
-                new_wait = 2 if new_wait_ms == 0 else int(new_wait_ms)
                 continue
+
+            elif transcript['ContentType'] == 'application/vnd.amazonaws.connect.event.participant.left':
+                logging.info('Agent left chat, disconnecting session')
+                message = 'The agent has disconnected.  To start a new chat, reply with keyword "Chat".'
+                send_response(phone_number, message, sms_identity)
+
+                response = chat.disconnect_participant(
+                    ConnectionToken=connection_token
+                )
+                stop_response = connect.stop_contact(
+                    ContactId=record['contact_id'],
+                    InstanceId=os.environ.get('CONNECT_INSTANCE_ID')
+                )
+
+                logging.info('Disconnect End User from Chat')
+                logging.info(response)
+                logging.info(stop_response)
+                chat_ended = True
+                break
 
             elif transcript['ContentType'] != 'text/plain':
                 logging.info('Got Something Not Text')
@@ -82,42 +98,32 @@ def lambda_handler(event, context):
             else:
                 message = transcript['Content']
                 logging.info('Got Message from Agent')
+                send_response(phone_number, message, sms_identity)
 
-                pinpoint.send_messages(
-                    ApplicationId=os.environ.get('PINPOINT_PROJECT_ID'),
-                    MessageRequest={
-                        'Addresses': {
-                            phone_number: {
-                                'ChannelType': 'SMS'
-                            }
-                        },
-                        'MessageConfiguration': {
-                            'SMSMessage': {
-                                'Body': message,
-                                'OriginationNumber': sms_identity
-                            }
-                        }
-                    }
-                )
 
         return {
+            'chat_ended': chat_ended,
             'phone_number': phone_number,
             'sms_identity': sms_identity,
-            'wait': new_wait,
-            'wait_ms': new_wait_ms,
             'last_id': new_last_id
         }
 
 
-
-def put_record(phone_number, sms_identity, contact_id, participation_token, connection_token):
-    table.put_item(
-        Item= {
-            'phone_number': phone_number,
-            'sms_identity': sms_identity,
-            'contact_id': contact_id,
-            'participation_token': participation_token,
-            'connection_token': connection_token
+def send_response(phone_number, message, sms_identity):
+    pinpoint.send_messages(
+        ApplicationId=os.environ.get('PINPOINT_PROJECT_ID'),
+        MessageRequest={
+            'Addresses': {
+                phone_number: {
+                    'ChannelType': 'SMS'
+                }
+            },
+            'MessageConfiguration': {
+                'SMSMessage': {
+                    'Body': message,
+                    'OriginationNumber': sms_identity
+                }
+            }
         }
     )
 
@@ -130,11 +136,3 @@ def get_record(phone_number, sms_identity):
         }
     )
     return response['Item']
-
-def delete_record(phone_number, sms_identity):
-    table.delete_item(
-        Key={
-            'phone_number': phone_number,
-            'sms_identity': sms_identity
-        }
-    )

@@ -94,6 +94,7 @@ Resources:
       Runtime: python3.8
       Environment:
         Variables:
+          CONNECT_INSTANCE_ID: !Ref ConnectInstanceId
           PINPOINT_PROJECT_ID: !Ref PinpointProjectId
       Policies:
         - Statement:
@@ -101,6 +102,10 @@ Resources:
             Effect: Allow
             Action: mobiletargeting:SendMessages
             Resource: !Sub arn:aws:mobiletargeting:${AWS::Region}:${AWS::AccountId}:apps/${PinpointProjectId}/messages
+          - Sid: ConnectStopChat
+            Effect: Allow
+            Action: connect:StopContact
+            Resource: !Sub "arn:aws:connect:${AWS::Region}:${AWS::AccountId}:instance/${ConnectInstanceId}/contact/*"
           - Sid: DynamoTableAccess
             Effect: "Allow"
             Action:
@@ -130,15 +135,15 @@ Resources:
                   "Default": "Wait",
                   "Choices": [
                     {
-                      "Variable": "$.wait",
-                      "NumericGreaterThan": 3600,
+                      "Variable": "$.chat_ended",
+                      "BooleanEquals": true,
                       "Next": "End"
                     }
                   ]
                 },
                 "Wait": {
                   "Type": "Wait",
-                  "SecondsPath": "$.wait",
+                  "Seconds": 2,
                   "Next": "Start"
                 },
                 "End": {
